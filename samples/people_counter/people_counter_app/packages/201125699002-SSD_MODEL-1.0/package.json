@@ -5,7 +5,16 @@
         "version": "1.0",
         "description": "Default description for package call_node_mxnet_ssd",
         "assets": [
-
+            {
+                "name": "model_asset",
+                "implementations": [
+                    {
+                        "type": "model",
+                        "assetUri": "b1a1589afe449b346ff47375c284a1998c3e1522b418a7be8910414911784ce1.tar.gz",
+                        "descriptorUri": "7260b76ae99292a3d7e51cba3437603e7255bcc300254a807ed0d1c3eaea298d.json"
+                    }
+                ]
+            }
         ],
         "interfaces": [
             {

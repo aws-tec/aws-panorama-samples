@@ -5,7 +5,16 @@
         "version": "1.0",
         "description": "Code package for app",
         "assets": [
-            
+            {
+                "name": "code_asset",
+                "implementations": [
+                    {
+                        "type": "container",
+                        "assetUri": "181f82623ca1385a71f4dad79add16a5cebe2341b719ea9abb0b4f7a4e46ff3d.tar.gz",
+                        "descriptorUri": "7bcce0237f7948e554b3d6a817949adbf3bec7f6fa1b8526c5567000d7f4c868.json"
+                    }
+                ]
+            }
         ],
         "interfaces": [
             {
