@@ -1,4 +1,3 @@
-from awscrt import mqtt
 import json
 import logging
 import time
@@ -16,7 +15,14 @@ import json
 import copy
 from sympy import Point, Polygon
 
-import command_line_utils;
+import zmq
+from multiprocessing import Process
+
+# Modify your account and other information here
+REGION = "ap-southeast-1"
+IOT_PUB_TOPIC = "panorama/people/event"
+S3_BUCKET_NAME = "panorama-tailgating-img-tec"
+DETECT_AREA = [(895, 903), (1327, 940), (1283, 1040), (842, 992)]
 
 def plot_polygon(im, cordon_coordinates=None, color=[0, 0, 255], line_thickness=10):
     [cv2.line(im, cordon_coordinates[idx], cordon_coordinates[idx + 1], color, line_thickness) for idx in
@@ -37,58 +43,16 @@ class Application(panoramasdk.node):
         # Desired class
         self.classids = [14.]
 
-        self.s3_client = boto3.resource('s3', region_name='ap-southeast-1')
-        #self.HOST = "192.168.1.107"
-        #self.PORT = 9527
+        self.s3_client = boto3.resource('s3', region_name=REGION)
+        self.iot_client = boto3.client('iot-data', region_name=REGION)
+
         self.last_count = 0
         self.current_count = 0
         self.total_count = 0
 
-        #self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        #self.s3_thread =
-
-        self.current_frame = None
-        self.detect_area = [(895, 903), (1327, 940), (1283, 1040), (842, 992)]
-        # office settings
-        p1, p2, p3, p4 = map(Point, [(895, 903), (1327, 940), (1283, 1040), (842, 992)])
+        # Polygon settings
+        p1, p2, p3, p4 = map(Point, DETECT_AREA)
         self.poly = Polygon(p1, p2, p3, p4)
-        # home settings
-        # p1, p2, p3, p4, p5, p6 = map(Point, [(903, 382), (1085, 327), (1076, 503), (1156, 538), (1001, 626), (908, 574)])
-        # self.poly = Polygon(p1, p2, p3, p4, p5, p6)
-
-        """AWS IoT MQTT Configuration"""
-        self.cmdUtils = command_line_utils.CommandLineUtils("PubSub - Send and recieve messages through an MQTT connection.")
-        self.cmdUtils.add_common_mqtt_commands()
-        self.cmdUtils.add_common_topic_message_commands()
-        self.cmdUtils.add_common_proxy_commands()
-        self.cmdUtils.add_common_logging_commands()
-        self.cmdUtils.register_command("key", "<path>", "Path to your key in PEM format.", default="/opt/aws/panorama/storage/src/test.key", type=str)
-        self.cmdUtils.register_command("cert", "<path>", "Path to your client certificate in PEM format.", default="/opt/aws/panorama/storage/src/test.crt", type=str)
-        self.cmdUtils.register_command("ca_file", "<path>", "Path to your root CA in PEM format.", default="/opt/aws/panorama/storage/src/root.ca.pem", type=str)
-        self.cmdUtils.register_command("endpoint", "<address_ep>", "Endpoint Name.", default="a1wantim6afpnp-ats.iot.ap-southeast-1.amazonaws.com", type=str)
-        self.cmdUtils.register_command("port", "<int>", "Connection port. AWS IoT supports 443 and 8883 (optional, default=auto).", default=443, type=int)
-        self.cmdUtils.register_command("client_id", "<str>", "Client ID to use for MQTT connection (optional, default='test-*').", default="panorama-" + str(uuid4()))
-        self.cmdUtils.register_command("count", "<int>", "The number of messages to send (optional, default='10').", default=10, type=int)
-        self.cmdUtils.register_command("is_ci", "<str>", "If present the sample will run in CI mode (optional, default='None')")
-
-        self.cmdUtils.get_args()
-
-        self.mqtt_connection = self.cmdUtils.build_mqtt_connection(self.on_connection_interrupted, self.on_connection_resumed)
-        self.connect_future = self.mqtt_connection.connect()
-
-        # Future.result() waits until a result is available
-        self.connect_future.result()
-        logger.info("AWS IoT: Connected!")
-
-        # Subscribe
-        #logger.info("Subscribing to topic '{}'...".format('panorama/badge/event'))
-        #self.subscribe_future, self.packet_id = self.mqtt_connection.subscribe(
-        #    topic='panorama/badge/event',
-        #    qos=mqtt.QoS.AT_LEAST_ONCE,
-        #    callback=self.on_message_received)
-
-        #self.subscribe_result = self.subscribe_future.result()
-        #logger.info("Subscribed with {}".format(str(self.subscribe_result['qos'])))
 
         try:
             # Parameters
@@ -100,37 +64,38 @@ class Application(panoramasdk.node):
             logger.info('Initialiation complete.')
             logger.info('Threshold: {}'.format(self.threshold))
 
-    def on_connection_interrupted(self, connection, error, **kwargs):
-        logger.info("Connection interrupted. error: {}".format(error))
+        Process(target=self.listener).start()
 
-    def on_connection_resumed(self, connection, return_code, session_present, **kwargs):
-        logger.info("Connection resumed. return_code: {} session_present: {}".format(return_code, session_present))
+        # Init zmq publisher
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PUB)
+        self.socket.bind("tcp://*:5555")
 
-        if return_code == mqtt.ConnectReturnCode.ACCEPTED and not session_present:
-            logger.info("Session did not persist. Resubscribing to existing topics...")
-            resubscribe_future, _ = connection.resubscribe_existing_topics()
-
-            # Cannot synchronously wait for resubscribe result because we're on the connection's event-loop thread,
-            # evaluate result with a callback instead.
-            resubscribe_future.add_done_callback(self.on_resubscribe_complete)
-
-    # Callback when the subscribed topic receives a message
-    def on_message_received(self, topic, payload, dup, qos, retain, **kwargs):
-        logger.info("Received message from topic '{}': {}".format(topic, payload))
-        copy_to_send = copy.deepcopy(self.current_frame)
+    def upload_image(self, s3_url, copy_to_send):
         raw_serial = cv2.imencode('.png', copy_to_send)[1].tostring()
-        self.s3_client.Object('panorama-tailgating', 'test').put(Body=raw_serial, ContentType='image/PNG')
+        fn = s3_url.split('/')[-1]
+        bucket = s3_url.split('/')[-2]
+        self.s3_client.Object(bucket, fn).put(Body=raw_serial, ContentType='image/PNG')
 
-        #if received_count == cmdUtils.get_command("count"):
-        #    received_all_event.set()
+    def listener(self):
+        context = zmq.Context()
+        socket = context.socket(zmq.SUB)
+        socket.connect("tcp://localhost:5555")
+        # Set setsockopt to receive all message
+        socket.setsockopt(zmq.SUBSCRIBE, "".encode('utf-8'))
 
-    def on_resubscribe_complete(self, resubscribe_future):
-        resubscribe_results = resubscribe_future.result()
-        logger.info("Resubscribe results: {}".format(resubscribe_results))
+        while True:
+            msg = socket.recv_pyobj()
+            self.upload_image(*msg)
+            #threading.Thread(target=self.ppe_iot_handler.detect_and_report, args=(*msg, )).start()
 
-        for topic, qos in resubscribe_results['topics']:
-            if qos is None:
-                logger.info("Server rejected resubscribe to topic: {}".format(topic))
+    def publish(self, socket, args):
+        """Usage
+        send_args = [[stream_ids[idx], result_boxes, self.cordon_area[idx], image_list[idx]], event_no]
+        self.publish(socket, send_args)
+        """
+        logger.info(f'Publish to s3')
+        socket.send_pyobj(args)
 
     def process_streams(self):
         """Processes one frame of video from one or more video streams."""
@@ -148,8 +113,6 @@ class Application(panoramasdk.node):
         """Runs inference on a frame of video."""
         image_data = preprocess(stream.image, self.MODEL_DIM)
         logger.debug(image_data.shape)
-
-        self.current_frame = stream.image
 
         # Run inference
         inference_results = self.call({"data":image_data}, self.MODEL_NODE)
@@ -186,13 +149,12 @@ class Application(panoramasdk.node):
                 for a in range(len(conf_data)):
                     if conf_data[a][0] * 100 > self.threshold and class_data[a][0] in self.classids:
                         (left, top, right, bottom) = np.clip(det_data[0][a]/self.MODEL_DIM,0,1)
-                        stream.add_rect(left, top, right, bottom)
+                        #stream.add_rect(left, top, right, bottom)
+                        cv2.rectangle(stream.image, (int(left * 1920), int(top * 1080)), (int(right * 1920), int(bottom * 1080)), (255, 88, 9), 2)
                         # office settings
                         check_bottom = bottom * 1080
                         check_mid = ((left + right) / 2) * 1920
-                        # home settings
-                        # check_bottom = bottom * 720
-                        # check_mid = ((left + right) / 2) * 1280
+
                         if self.poly.encloses_point(Point(check_mid, check_bottom)):
                             num_people += 1
                     else:
@@ -201,29 +163,42 @@ class Application(panoramasdk.node):
 
         self.current_count = num_people
 
+        send_args = None
         if self.current_count != self.last_count :
             logger.info('# people {}'.format(str(num_people)))
             if self.current_count > self.last_count :
                 self.total_count += self.current_count - self.last_count
-                # Pack image to upload to s3
-                # 1666769959_298565.png
 
+            ts = datetime.timestamp(now)
             data = {
-                "timestamp": datetime.timestamp(now),
+                "timestamp": ts,
                 "last_count": self.last_count,
                 "current_count": self.current_count,
-                "camera_name": stream.stream_id
+                "camera_name": stream.stream_id,
+                "s3_url": "s3://{}/{}.png".format(S3_BUCKET_NAME, ts)
             }
+            send_args = [data["s3_url"]]
+
             self.last_count = self.current_count
             message_json = json.dumps(data)
-            self.mqtt_connection.publish(
-                topic='panorama/people/event',
-                payload=message_json,
-                qos=mqtt.QoS.AT_MOST_ONCE)
+            self.iot_client.publish(
+                topic=IOT_PUB_TOPIC,
+                payload=bytes(message_json, "utf-8"),
+                qos=1)
 
-        #logger.info('# Tec {} {} {}'.format(str(num_people), str(self.current_conut), str(self.last_count)))
-        stream.add_label('# total people {}'.format(str(self.total_count)), 0.1, 0.1)
-        plot_polygon(stream.image, self.detect_area, line_thickness=3)
+        cv2.putText(stream.image,
+            text='# total people {}'.format(str(self.total_count)),
+            org=(200, 100),
+            fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+            fontScale=1.0,
+            color=(255, 255, 255),
+            thickness=2,
+            lineType=cv2.LINE_4)
+        plot_polygon(stream.image, DETECT_AREA, line_thickness=3)
+
+        if send_args:
+            send_args.append(copy.deepcopy(stream.image))
+            self.publish(self.socket, send_args)
 
 
 def preprocess(img, size):
@@ -257,6 +232,7 @@ def get_logger(name=__name__,level=logging.INFO):
 def main():
     try:
         logger.info("INITIALIZING APPLICATION")
+
         app = Application()
         logger.info("PROCESSING STREAMS")
         while True:
